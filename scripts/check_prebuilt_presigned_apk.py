@@ -36,12 +36,12 @@ def has_preprocessed_issues(args, *, fail=False):
                 if fail:
                     sys.exit(args.apk + ': Contains compressed JNI libraries')
                 return True
-            # It's ok for non-privileged apps to have compressed dex files, see go/gms-uncompressed-jni-slides
-            if args.privileged:
-                if info.filename.endswith('.dex') and info.compress_type != zipfile.ZIP_STORED:
-                    if fail:
-                        sys.exit(args.apk + ': Contains compressed dex files and is privileged')
-                    return True
+            # It's ok for both non-privileged and privileged apps to have compressed dex files, for our GAPPS purpose
+            #if args.privileged:
+                #if info.filename.endswith('.dex') and info.compress_type != zipfile.ZIP_STORED:
+                    #if fail:
+                        #sys.exit(args.apk + ': Contains compressed dex files and is privileged')
+                    #return True
     return False
 
 
