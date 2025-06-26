@@ -164,7 +164,6 @@ type prebuiltModuleProperties struct {
 	Ramdisk             *bool
 
 	Srcs []string
-	Dsts []string
 
 	No_full_install *bool
 
@@ -216,6 +215,7 @@ var (
 		"system":              etc.PrebuiltSystemFactory,
 		"res":                 etc.PrebuiltResFactory,
 		"rfs":                 etc.PrebuiltRfsFactory,
+		"tee":                 etc.PrebuiltTeeFactory,
 		"tts":                 etc.PrebuiltVoicepackFactory,
 		"tvconfig":            etc.PrebuiltTvConfigFactory,
 		"tvservice":           etc.PrebuiltTvServiceFactory,
@@ -227,6 +227,7 @@ var (
 		"usr/idc":             etc.PrebuiltUserIdcFactory,
 		"vendor":              etc.PrebuiltVendorFactory,
 		"vendor_dlkm":         etc.PrebuiltVendorDlkmFactory,
+		"vendor_overlay":      etc.PrebuiltVendorOverlayFactory,
 		"wallpaper":           etc.PrebuiltWallpaperFactory,
 		"wlc_upt":             etc.PrebuiltWlcUptFactory,
 	}
@@ -301,6 +302,7 @@ func createPrebuiltEtcModulesInDirectory(ctx android.LoadHookContext, partition,
 			etcInstallPathKey = etcInstallPath
 		}
 	}
+	moduleFactory := etcInstallPathToFactoryList[etcInstallPathKey]
 	relDestDirFromInstallDirBase, _ := filepath.Rel(etcInstallPathKey, destDir)
 
 	for fileIndex := range maxLen {
@@ -335,6 +337,10 @@ func createPrebuiltEtcModulesInDirectory(ctx android.LoadHookContext, partition,
 			propsList = append(propsList, &prebuiltInstallInRootProperties{
 				Install_in_root: proptools.BoolPtr(true),
 			})
+			// Discard any previously picked module and force it to prebuilt_{root,any} as
+			// they are the only modules allowed to specify the `install_in_root` property.
+			etcInstallPathKey = ""
+			relDestDirFromInstallDirBase = destDir
 		}
 
 		// Set appropriate srcs, dsts, and releative_install_path based on
@@ -356,23 +362,24 @@ func createPrebuiltEtcModulesInDirectory(ctx android.LoadHookContext, partition,
 		}
 
 		if allCopyFileNamesUnchanged {
-			// Specify relative_install_path if it is not installed in the root directory of the
-			// partition
+			// Specify relative_install_path if it is not installed in the base directory of the module.
+			// In case of prebuilt_{root,any} this is equivalent to the root of the partition.
 			if !android.InList(relDestDirFromInstallDirBase, []string{"", "."}) {
 				propsList = append(propsList, &prebuiltSubdirProperties{
 					Relative_install_path: proptools.StringPtr(relDestDirFromInstallDirBase),
 				})
 			}
 		} else {
-			modulePropsPtr.Srcs = srcBaseFiles
-			dsts := []string{}
+			dsts := proptools.NewConfigurable[[]string](nil, nil)
 			for _, installBaseFile := range installBaseFiles {
-				dsts = append(dsts, filepath.Join(relDestDirFromInstallDirBase, installBaseFile))
+				dsts.AppendSimpleValue([]string{filepath.Join(relDestDirFromInstallDirBase, installBaseFile)})
 			}
-			modulePropsPtr.Dsts = dsts
+			propsList = append(propsList, &etc.PrebuiltDstsProperties{
+				Dsts: dsts,
+			})
 		}
 
-		ctx.CreateModuleInDirectory(etcInstallPathToFactoryList[etcInstallPathKey], srcDir, propsList...)
+		ctx.CreateModuleInDirectory(moduleFactory, srcDir, propsList...)
 		moduleNames = append(moduleNames, moduleName)
 	}
 

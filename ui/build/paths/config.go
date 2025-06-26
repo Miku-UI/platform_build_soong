@@ -42,7 +42,7 @@ var Allowed = PathConfig{
 }
 
 // This tool is specifically disallowed and calling it will result in an
-// "executable no found" error.
+// "executable not found" error.
 var Forbidden = PathConfig{
 	Symlink: false,
 	Log:     true,
@@ -125,6 +125,10 @@ var Configuration = map[string]PathConfig{
 	"ld.gold":    Forbidden,
 	"perl":		  Allowed,// HACK
 	"pkg-config": Forbidden,
+	"python":     Forbidden,
+	"python2":    Forbidden,
+	"python2.7":  Forbidden,
+	"python3":    Forbidden,
 
 	// These are toybox tools that only work on Linux.
 	"pgrep": LinuxOnlyPrebuilt,

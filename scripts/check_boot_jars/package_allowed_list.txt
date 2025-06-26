@@ -277,3 +277,8 @@ qcom.fmradio
 ###################################################
 # IFAA Manager used for Alipay and/or WeChat payment
 org\.ifaa\.android\.manager.*
+
+###################################################
+# Packages used for wear-sdk in Wear OS
+com\.google\.wear
+com\.google\.wear\..*
