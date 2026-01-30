@@ -16,7 +16,6 @@ package cc
 
 import (
 	"fmt"
-	"io"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -815,9 +814,6 @@ type libraryInterface interface {
 	// Gets the ABI properties for vendor, product, or platform variant
 	getHeaderAbiCheckerProperties(m *Module) headerAbiCheckerProperties
 
-	// Write LOCAL_ADDITIONAL_DEPENDENCIES for ABI diff
-	androidMkWriteAdditionalDependenciesForSourceAbiDiff(w io.Writer)
-
 	apexAvailable() []string
 
 	setAPIListCoverageXMLPath(out android.ModuleOutPath)
@@ -1095,10 +1091,6 @@ func (library *libraryDecorator) moduleInfoJSON(ctx ModuleContext, moduleInfoJSO
 	library.baseLinker.moduleInfoJSON(ctx, moduleInfoJSON)
 }
 
-func (library *libraryDecorator) testSuiteInfo(ctx ModuleContext) {
-	// not a test
-}
-
 func (library *libraryDecorator) linkStatic(ctx ModuleContext,
 	flags Flags, deps PathDeps, objs Objects) android.Path {
 
@@ -1217,8 +1209,8 @@ func (library *libraryDecorator) linkShared(ctx ModuleContext,
 	}
 
 	fileName := library.getLibName(ctx) + flags.Toolchain.ShlibSuffix()
-	outputFile := android.PathForModuleOut(ctx, fileName)
-	unstrippedOutputFile := outputFile
+	outputFile := android.PathForModuleOut(ctx, "before_final_validations", fileName)
+	finalOutputFile := outputFile
 
 	var implicitOutputs android.WritablePaths
 	if ctx.Windows() {
@@ -1306,17 +1298,28 @@ func (library *libraryDecorator) linkShared(ctx ModuleContext,
 		}
 	}
 
+	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.StaticLibObjs.sAbiDumpFiles...)
+	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.WholeStaticLibObjs.sAbiDumpFiles...)
+	library.linkSAbiDumpFiles(ctx, deps, objs, fileName, finalOutputFile)
+
 	transformObjToDynamicBinary(ctx, objs.objFiles, sharedLibs,
 		deps.StaticLibs, deps.LateStaticLibs, deps.WholeStaticLibs, linkerDeps, deps.CrtBegin,
 		deps.CrtEnd, false, builderFlags, outputFile, implicitOutputs, objs.tidyDepFiles)
 
+	// We want to run the abi diff when the binary is built, but both the source abi report and
+	// the abi diff depends on the binary. create_reference_dumps.py tries to build the source
+	// reports to update the checked-in reports for the diff, so it needs to be able to build the
+	// source report without running the abi diff (because it's failing, and the user is trying to
+	// update it). So copy the binary to a new location and build the abi diffs when doing that
+	// copy, so that the source report doesn't have a path to the abi diffs.
+	copied := android.PathForModuleOut(ctx, fileName)
+	android.CopyFileRule(ctx, finalOutputFile, copied, library.sAbiDiff...)
+	finalOutputFile = copied
+
 	objs.coverageFiles = append(objs.coverageFiles, deps.StaticLibObjs.coverageFiles...)
 	objs.coverageFiles = append(objs.coverageFiles, deps.WholeStaticLibObjs.coverageFiles...)
-	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.StaticLibObjs.sAbiDumpFiles...)
-	objs.sAbiDumpFiles = append(objs.sAbiDumpFiles, deps.WholeStaticLibObjs.sAbiDumpFiles...)
 
 	library.coverageOutputFile = transformCoverageFilesToZip(ctx, objs, library.getLibName(ctx))
-	library.linkSAbiDumpFiles(ctx, deps, objs, fileName, unstrippedOutputFile)
 
 	var transitiveStaticLibrariesForOrdering depset.DepSet[android.Path]
 	if static := ctx.GetDirectDepsProxyWithTag(staticVariantTag); len(static) > 0 {
@@ -1326,7 +1329,7 @@ func (library *libraryDecorator) linkShared(ctx ModuleContext,
 
 	android.SetProvider(ctx, SharedLibraryInfoProvider, SharedLibraryInfo{
 		TableOfContents:                      android.OptionalPathForPath(tocFile),
-		SharedLibrary:                        unstrippedOutputFile,
+		SharedLibrary:                        finalOutputFile,
 		TransitiveStaticLibrariesForOrdering: transitiveStaticLibrariesForOrdering,
 		Target:                               ctx.Target(),
 		IsStubs:                              library.BuildStubs(),
@@ -1334,7 +1337,7 @@ func (library *libraryDecorator) linkShared(ctx ModuleContext,
 
 	AddStubDependencyProviders(ctx)
 
-	return unstrippedOutputFile
+	return finalOutputFile
 }
 
 // Visits the stub variants of the library and returns a struct containing the stub .so paths
@@ -1573,7 +1576,10 @@ func (library *libraryDecorator) optInAbiDiff(ctx android.ModuleContext,
 
 	// Most opt-in libraries do not have dumps for all default architectures.
 	if ctx.Config().HasDeviceProduct() {
-		errorMessage += " --product " + ctx.Config().DeviceProduct()
+		// Instead of showing the product name directly, use an env variable to
+		// the error message to avoid changing build rules just because of lunch
+		// target change.
+		errorMessage += " --product $$TARGET_PRODUCT"
 	}
 
 	library.sourceAbiDiff(ctx, sourceDump, referenceDump, baseName, nameExt,
@@ -1599,6 +1605,7 @@ func (library *libraryDecorator) linkSAbiDumpFiles(ctx ModuleContext, deps PathD
 		var llndkDump, apexVariantDump android.Path
 		tags := classifySourceAbiDump(ctx.Module().(*Module))
 		optInTags := []lsdumpTag{}
+		lsDumps := TaggedLsDumpsInfo{}
 		for _, tag := range tags {
 			if tag == llndkLsdumpTag && currVendorVersion != "" {
 				if llndkDump == nil {
@@ -1614,7 +1621,7 @@ func (library *libraryDecorator) linkSAbiDumpFiles(ctx ModuleContext, deps PathD
 						headerAbiChecker.Exclude_symbol_tags,
 						nativeClampedApiLevel(ctx, sdkVersion).String())
 				}
-				addLsdumpPath(ctx.Config(), string(tag)+":"+llndkDump.String())
+				lsDumps = append(lsDumps, taggedLsDump{tag, llndkDump})
 			} else if tag == apexLsdumpTag {
 				if apexVariantDump == nil {
 					apexVariantDump = library.linkApexSAbiDumpFiles(ctx,
@@ -1623,14 +1630,15 @@ func (library *libraryDecorator) linkSAbiDumpFiles(ctx ModuleContext, deps PathD
 						headerAbiChecker.Exclude_symbol_tags,
 						currSdkVersion)
 				}
-				addLsdumpPath(ctx.Config(), string(tag)+":"+apexVariantDump.String())
+				lsDumps = append(lsDumps, taggedLsDump{tag, apexVariantDump})
 			} else {
 				if tag.dirName() == "" {
 					optInTags = append(optInTags, tag)
 				}
-				addLsdumpPath(ctx.Config(), string(tag)+":"+implDump.String())
+				lsDumps = append(lsDumps, taggedLsDump{tag, implDump})
 			}
 		}
+		android.SetProvider(ctx, TaggedLsDumpsInfoProvider, lsDumps)
 
 		// Diff source dumps and reference dumps.
 		for _, tag := range tags {
@@ -1929,7 +1937,7 @@ func (library *libraryDecorator) install(ctx ModuleContext, file android.Path) {
 		CtxIsForPlatform(ctx) && !ctx.isPreventInstall() {
 		installPath := getUnversionedLibraryInstallPath(ctx).Join(ctx, file.Base())
 
-		ctx.ModuleBuild(pctx, android.ModuleBuildParams{
+		ctx.Build(pctx, android.BuildParams{
 			Rule:        android.Cp,
 			Description: "install " + installPath.Base(),
 			Output:      installPath,
@@ -2468,7 +2476,7 @@ func (versionTransitionMutator) Split(ctx android.BaseModuleContext) []string {
 			setStubsVersions(ctx, m)
 			return append(slices.Clone(m.VersionedInterface().AllStubsVersions()), "")
 		} else if m.SplitPerApiLevel() && m.IsSdkVariant() {
-			return perApiVersionVariations(ctx, m.MinSdkVersion())
+			return perApiVersionVariations(ctx, m.MinSdkVersion(ctx))
 		}
 	}
 
@@ -2546,7 +2554,7 @@ func (versionTransitionMutator) Mutate(ctx android.BottomUpMutatorContext, varia
 			}
 		}
 	} else if ok && m.SplitPerApiLevel() && m.IsSdkVariant() {
-		m.SetSdkVersion(variation)
+		m.SetSdkVersion(StringPtr(variation))
 		m.SetMinSdkVersion(variation)
 	}
 }
