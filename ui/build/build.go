@@ -19,6 +19,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -394,6 +395,8 @@ func Build(ctx Context, config Config) {
 			installCleanIfNecessary(ctx, config)
 		}
 		partialCompileCleanIfNecessary(ctx, config)
+		// Only print what this build wrote, not what a failed build left behind
+		os.Remove(postBuildMessageFile(config))
 		runNinjaForBuild(ctx, config)
 		updateBuildIdDir(ctx, config)
 
@@ -403,6 +406,13 @@ func Build(ctx Context, config Config) {
 
 	if what&RunDistActions != 0 {
 		runDistActions(ctx, config)
+	}
+	if what&RunNinja != 0 {
+		// Last: the dist actions and copies can still print or fail the build
+		if config.Dist() {
+			waitForDist(ctx)
+		}
+		printPostBuildMessage(ctx, config)
 	}
 	done = true
 }
@@ -414,6 +424,34 @@ func updateBuildIdDir(ctx Context, config Config) {
 	symbolsDir := filepath.Join(config.ProductOut(), "symbols")
 	if err := elf.UpdateBuildIdDir(symbolsDir); err != nil {
 		ctx.Printf("failed to update %s/.build-id: %v", symbolsDir, err)
+	}
+}
+
+// postBuildMessageFile is where build rules append a message for the end of a successful
+// build (vendor/miku's diva writes the Miku UI banner there). Output printed by a rule
+// itself is not necessarily the last thing on screen: ninja runs the validations nothing
+// depends on (metalava API lint, ABI diffs, ...) last, after the requested targets.
+func postBuildMessageFile(config Config) string {
+	return filepath.Join(config.OutDir(), "post_build_message.txt")
+}
+
+// printPostBuildMessage prints and removes the post build message, once ninja has
+// finished every action.
+func printPostBuildMessage(ctx Context, config Config) {
+	file := postBuildMessageFile(config)
+	msg, err := os.ReadFile(file)
+	if os.IsNotExist(err) {
+		return
+	} else if err != nil {
+		ctx.Printf("failed to read %s: %v", file, err)
+		return
+	}
+	os.Remove(file)
+
+	if text := strings.TrimRight(string(msg), "\n"); text != "" {
+		st := ctx.Status.StartTool()
+		defer st.Finish()
+		st.Print(text)
 	}
 }
 
